@@ -1,0 +1,473 @@
+#!/usr/bin/env python
+
+'''wsb - Website Backup'''
+
+from __future__ import unicode_literals
+
+__copyright__ = '''\
+Copyright (C) Volker Diels-Grabsch <v@njh.eu>
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+'''
+
+from collections import namedtuple
+from os import chdir, execve, listdir, remove, stat
+from os.path import dirname, isdir, isfile, join, split
+from re import escape, match
+from subprocess import CalledProcessError, PIPE, Popen, STDOUT, call
+from sys import argv, stderr, stdout
+
+def map_dict_values(d, mappings):
+    return {
+        k: mappings[k](v) if k in mappings else v
+        for k, v in d.items()
+    }
+
+def merge_dicts(*args):
+    r = {}
+    for d in args:
+        r.update(d)
+    return r
+
+def get_filename(path):
+    dirpath, filename = split(path)
+    return filename
+
+class DependencyCommand(
+        namedtuple('DependencyCommand', [
+            'command',
+            'check_arg',
+        ])):
+
+    @property
+    def name(self):
+        return self.command
+
+    def available(self):
+        args = [self.command, self.check_arg]
+        try:
+            proc = Popen(args, stdin=PIPE, stdout=PIPE, stderr=STDOUT, env={})
+            out, err = proc.communicate(b'')
+        except CalledProcessError as e:
+            return False
+        return True
+
+class DependencyList(
+        namedtuple('DependencyList', [
+            'dependencies',
+        ])):
+
+    def add(self, dependency):
+        self.dependencies.append(dependency)
+
+    def missing(self):
+        return [
+            dependency
+            for dependency in self.dependencies
+            if not dependency.available()
+        ]
+
+    def check(self):
+        missing_dependencies = self.missing()
+        if missing_dependencies:
+            for dependency in missing_dependencies:
+                stderr.write('Error: Missing dependency: {dependency.name}\n'.format(**locals()))
+            exit(1)
+
+dependencies = DependencyList([])
+dependencies.add(DependencyCommand('git', '--version'))
+dependencies.add(DependencyCommand('rsync', '--version'))
+
+class MatchError(Exception):
+    pass
+
+class Dir:
+
+    def __init__(self, *args):
+        self.sub_list = args
+
+    def _get_item_param(self, sub_path):
+        matches = []
+        for name, sub_cls in self.sub_list:
+            item = sub_cls.dir_spec.match_load(sub_cls, sub_path)
+            if item is not None:
+                matches.append((name, item))
+        if len(matches) == 0:
+            sub_names = [name for name, sub_cls in self.sub_list]
+            raise MatchError('Unable to match path {sub_path!r} to any of {sub_names!r}'.format(**locals()))
+        if len(matches) != 1:
+            match_names = [name for name, item in matches]
+            raise MatchError('Ambiguous match of path {sub_path!r} with {match_names!r}'.format(**locals()))
+        return matches[0]
+
+    def get_item_params(self, path):
+        sub_paths = [join(path, filename) for filename in sorted(listdir(path))]
+        item_params = {name: [] for name, sub_cls in self.sub_list}
+        for sub_path in sub_paths:
+            name, item = self._get_item_param(sub_path)
+            item_params[name].append(item)
+        combiners = {name: sub_cls.dir_spec.combine for name, sub_cls in self.sub_list}
+        return {
+            name: combiners[name](item_list)
+            for name, item_list in item_params.items()
+        }
+
+class EmptyFile:
+
+    def get_item_params(self, path):
+        if not isfile(path):
+            raise MatchError('Not a file: {path!r}'.format(**locals()))
+        if stat(path).st_size != 0:
+            raise MatchError('Not an empty file: {path!r}'.format(**locals()))
+        return {}
+
+class AnyFile:
+
+    def get_item_params(self, path):
+        if not isfile(path):
+            raise MatchError('Not a file: {path!r}'.format(**locals()))
+        return {}
+
+class AnyDir:
+
+    def get_item_params(self, path):
+        if not isdir(path):
+            raise MatchError('Not a directory: {path!r}'.format(**locals()))
+        return {}
+
+class DirSpec(
+        namedtuple('DirSpec', [
+            'combine',
+            'regex',
+            'mappings',
+            'entry',
+        ])):
+
+    @staticmethod
+    def load(result_cls, path):
+        return result_cls.dir_spec.match_load(result_cls, path)
+
+    def match_load(self, result_cls, path):
+        m = match(self.regex, get_filename(path))
+        if m is None:
+            return None
+        regex_params = map_dict_values(m.groupdict(), self.mappings)
+        item_params = self.entry.get_item_params(path)
+        return result_cls(path=path, **merge_dicts(regex_params, item_params))
+
+class PathExists(
+        namedtuple('PathExists', [
+            'filename',
+            'entry',
+        ])):
+
+    @property
+    def dir_spec(self):
+        return DirSpec(
+            combine=bool,
+            regex='^{}$'.format(escape(self.filename)),
+            mappings=dict(),
+            entry=self.entry,
+        )
+
+    def __call__(self, path):
+        return path
+
+class RemoteDir(
+        namedtuple('RemoteDir', [
+            'path',
+            'remote_path',
+            'data_dir_exists',
+            'permissions_file_exists',
+        ])):
+
+    def _convert_remote_path(raw_remote_path):
+        return '/' + raw_remote_path.replace('_', '/')
+
+    dir_spec = DirSpec(
+        combine=list,
+        regex=r'^dir_(?P<remote_path>[a-zA-Z0-9.][a-zA-Z0-9._-]*)$',
+        mappings=dict(
+            remote_path=_convert_remote_path,
+        ),
+        entry=Dir(
+            ('data_dir_exists', PathExists('data', AnyDir())),
+            ('permissions_file_exists', PathExists('permissions.sh', AnyFile())),
+        ),
+    )
+
+    def to_shell_script(self, rsync_prefix, ssh_prefix):
+        filename = get_filename(self.path)
+        return (
+            '    (\n'
+            '        cd {filename}\n'
+            '        {rsync_prefix}{self.remote_path}/ data/\n'
+            '    )\n'
+            .format(**locals())
+        )
+
+class NodataTable(
+        namedtuple('NodataTable', [
+            'path',
+            'table',
+        ])):
+
+    dir_spec = DirSpec(
+        combine=list,
+        regex=r'^nodata_(?P<table>[a-zA-Z][a-zA-Z0-9_]*)$',
+        mappings=dict(),
+        entry=EmptyFile(),
+    )
+
+class RemoteMysql(
+        namedtuple('RemoteMysql', [
+            'path',
+            'dbname',
+            'dump_file_exists',
+            'nodata_tables',
+        ])):
+
+    dir_spec = DirSpec(
+        combine=list,
+        regex=r'^mysql_(?P<dbname>[a-zA-Z0-9._][a-zA-Z0-9._-]*)$',
+        mappings=dict(),
+        entry=Dir(
+            ('dump_file_exists', PathExists('dump.sql', AnyFile())),
+            ('nodata_tables', NodataTable),
+        ),
+    )
+
+    def to_shell_script(self, rsync_prefix, ssh_prefix):
+        filename = get_filename(self.path)
+        ignore_tables = ''.join(
+            ' --ignore-table {self.dbname}.{nodata_table.table}'.format(self=self, nodata_table=nodata_table)
+            for nodata_table in self.nodata_tables
+        )
+        return (
+            '    (\n'
+            '        cd {filename}\n'
+            '        {ssh_prefix}"\n'
+            '            set -eu\n'
+            '            (\n'
+            '                mysqldump --no-data {self.dbname}\n'
+            '                mysqldump --no-create-info --skip-extended-insert --complete-insert{ignore_tables} {self.dbname}\n'
+            '            ) | egrep -v ^--.Dump.completed.on > /tmp/mysql_{self.dbname}_$UUID.sql"\n'
+            '        {rsync_prefix}"/tmp/mysql_{self.dbname}_$UUID.sql" dump.sql\n'
+            '        {ssh_prefix}"\n'
+            '            set -eu\n'
+            '            rm -f /tmp/mysql_{self.dbname}_$UUID.sql"\n'
+            '    )\n'
+            .format(**locals())
+        )
+
+class RemotePgsql(
+        namedtuple('RemotePgsql', [
+            'path',
+            'dbname',
+            'dump_file_exists',
+            'nodata_tables', # TODO pg_dump --exclude-table-data
+        ])):
+
+    dir_spec = DirSpec(
+        combine=list,
+        regex=r'^pgsql_(?P<dbname>[a-zA-Z0-9._][a-zA-Z0-9._-]*)$',
+        mappings=dict(),
+        entry=Dir(
+            ('dump_file_exists', PathExists('dump.sql', AnyFile())),
+            ('nodata_tables', NodataTable),
+        ),
+    )
+
+    def to_shell_script(self, rsync_prefix, ssh_prefix):
+        filename = get_filename(self.path)
+        exclude_table_data = ''.join(
+            ' --exclude-table-data {nodata_table.table}'.format(**locals())
+            for nodata_table in self.nodata_tables
+        )
+        return (
+            '    (\n'
+            '        cd {filename}\n'
+            '        {ssh_prefix}"\n'
+            '            set -eu\n'
+            '            pg_dump{exclude_table_data} {self.dbname} > /tmp/pgsql_{self.dbname}_$UUID.sql"\n'
+            '        {rsync_prefix}"/tmp/pgsql_{self.dbname}_$UUID.sql" dump.sql\n'
+            '        {ssh_prefix}"\n'
+            '            set -eu\n'
+            '            rm -f /tmp/pgsql_{self.dbname}_$UUID.sql"\n'
+            '    )\n'
+            .format(**locals())
+        )
+
+class RemoteAccount(
+        namedtuple('RemoteAccount', [
+            'path',
+            'host',
+            'port',
+            'user',
+            'remote_dirs',
+            'mysql_databases',
+            'pgsql_databases',
+        ])):
+
+    dir_spec = DirSpec(
+        combine=list,
+        regex=r'^(?P<host>[a-z0-9][a-z0-9.-]*)_(?P<port>[0-9]+)_(?P<user>[a-z][a-z0-9_]*)$',
+        mappings=dict(
+            port=int,
+        ),
+        entry=Dir(
+            ('remote_dirs', RemoteDir),
+            ('mysql_databases', RemoteMysql),
+            ('pgsql_databases', RemotePgsql),
+        ),
+    )
+
+    def to_shell_script(self):
+        filename = get_filename(self.path)
+        rsync_prefix = 'rsync -avzP --delete-delay -e "ssh -p {self.port}" {self.user}@{self.host}:'.format(**locals())
+        ssh_prefix = 'ssh -p {self.port} {self.user}@{self.host} -- '.format(**locals())
+        shell_script = (
+            '(\n'
+            '    cd {filename}\n'
+            .format(**locals())
+        )
+        for item_list in [self.remote_dirs, self.mysql_databases, self.pgsql_databases]:
+            for item in item_list:
+                shell_script += item.to_shell_script(rsync_prefix, ssh_prefix)
+        shell_script += (
+            ')\n'
+        )
+        return shell_script
+
+class Backup(
+        namedtuple('Backup', [
+            'path',
+            'git_dir_exists',
+            'remote_accounts',
+        ])):
+
+    dir_spec = DirSpec(
+        combine=list,
+        regex=r'.*',
+        mappings=dict(),
+        entry=Dir(
+            ('git_dir_exists', PathExists('.git', AnyDir())),
+            ('remote_accounts', RemoteAccount),
+        ),
+    )
+
+    @classmethod
+    def load(cls, path):
+        return DirSpec.load(cls, path)
+
+    def to_shell_script(self):
+        if not match(r'[/a-zA-Z0-9_.-]+', self.path):
+            raise Exception('Path contains possibly unsafe characters: {self.path!r}'.format(**locals*()))
+        shell_script = (
+            '#!/bin/sh\n'
+            'set -eu\n'
+            'START_DATETIME=$(date --utc "+%Y-%m-%d %H:%M:%SZ")\n'
+            'UUID=$(python -c "import uuid; print(uuid.uuid4())")\n'
+            'cd -- "{self.path}"\n'
+            .format(**locals())
+        )
+        if not self.git_dir_exists:
+            shell_script += 'git init\n'
+        for remote_account in self.remote_accounts:
+            shell_script += remote_account.to_shell_script()
+        shell_script += (
+            'END_DATETIME=$(date --utc "+%Y-%m-%d %H:%M:%SZ")\n'
+            'git add .\n'
+            'git diff-index --quiet HEAD || git -c user.name="Website Backup (wsb)" -c user.email="wsb@localhost" commit -am "Backup $START_DATETIME - $END_DATETIME"\n'
+        )
+        return shell_script
+
+    def dryrun(self):
+        stdout.write(self.to_shell_script())
+
+    def backup(self):
+        args = ['/bin/sh', '-c', self.to_shell_script()]
+        env = {}
+        execve(args[0], args, env)
+
+def test():
+    for python in ['python2', 'python3']:
+        stdout.write('{python}: '.format(**locals()))
+        stdout.flush()
+        ret = call([python, '--', __file__, 'test_single'], env={})
+        if ret != 0:
+            exit(1)
+
+def test_single():
+    chdir(dirname(__file__))
+    for testname in sorted(listdir('tests')):
+        testdir = join('tests', testname)
+        backup = Backup.load(join(testdir, 'backup'))
+        result = backup.to_shell_script()
+        expected_path = join(testdir, 'expected.sh')
+        with open(expected_path, 'rb') as f:
+            expected = f.read().decode('utf8')
+        if expected != result:
+            stdout.write('Test failed: {testname}\n'.format(**locals()))
+            result_path = join(testdir, 'result.sh')
+            with open(result_path, 'wb') as f:
+                f.write(result.encode('utf8'))
+            call(['diff', '-u', '--', expected_path, result_path], env={})
+            remove(result_path)
+            exit(1)
+    stdout.write('OK\n')
+
+def shell():
+    from IPython import embed
+    try:
+        from traitlets.config import Config
+    except ImportError:
+        from IPython.config import Config
+    embed(config=Config(IPCompleter=Config(greedy=True)))
+
+def usage():
+    stderr.write(
+        __doc__ + '\n'
+        '\n'
+        'Usage:\n'
+        '\n'
+        '    wsb backup /PATH/TO/BACKUP\n'
+        '    wsb dryrun /PATH/TO/BACKUP\n'
+        '    wsb test\n'
+        '    wsb test_single\n'
+        '    wsb shell\n'
+        '\n'
+    )
+    exit(1)
+
+def main():
+    dependencies.check()
+    try:
+        command = argv[1]
+    except IndexError:
+        return usage()
+    command_args = argv[2:]
+    if command == 'backup' and len(command_args) == 1:
+        return Backup.load(*command_args).backup()
+    if command == 'dryrun' and len(command_args) == 1:
+        return Backup.load(*command_args).dryrun()
+    if command == 'test' and len(command_args) == 0:
+        return test(*command_args)
+    if command == 'test_single' and len(command_args) == 0:
+        return test_single(*command_args)
+    if command == 'shell' and len(command_args) == 0:
+        return shell(*command_args)
+    return usage()
+
+if __name__ == '__main__':
+    main()
