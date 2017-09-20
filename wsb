@@ -206,7 +206,7 @@ class RemoteDir(
         ),
     )
 
-    def to_shell_script(self, rsync_prefix, ssh_prefix):
+    def to_shell_script(self, is_root, rsync_prefix, ssh_prefix):
         filename = get_filename(self.path)
         return (
             '    (\n'
@@ -247,7 +247,7 @@ class RemoteMysql(
         ),
     )
 
-    def to_shell_script(self, rsync_prefix, ssh_prefix):
+    def to_shell_script(self, is_root, rsync_prefix, ssh_prefix):
         filename = get_filename(self.path)
         ignore_tables = ''.join(
             ' --ignore-table {self.dbname}.{nodata_table.table}'.format(self=self, nodata_table=nodata_table)
@@ -288,7 +288,7 @@ class RemotePgsql(
         ),
     )
 
-    def to_shell_script(self, rsync_prefix, ssh_prefix):
+    def to_shell_script(self, is_root, rsync_prefix, ssh_prefix):
         filename = get_filename(self.path)
         exclude_table_data = ''.join(
             ' --exclude-table-data {nodata_table.table}'.format(**locals())
@@ -334,6 +334,7 @@ class RemoteAccount(
 
     def to_shell_script(self):
         filename = get_filename(self.path)
+        is_root = (self.user == 'root')
         rsync_prefix = 'rsync -avzP --delete-delay -e "ssh -p {self.port}" {self.user}@{self.host}:'.format(**locals())
         ssh_prefix = 'ssh -p {self.port} {self.user}@{self.host} -- '.format(**locals())
         shell_script = (
@@ -343,7 +344,7 @@ class RemoteAccount(
         )
         for item_list in [self.remote_dirs, self.mysql_databases, self.pgsql_databases]:
             for item in item_list:
-                shell_script += item.to_shell_script(rsync_prefix, ssh_prefix)
+                shell_script += item.to_shell_script(is_root, rsync_prefix, ssh_prefix)
         shell_script += (
             ')\n'
         )
