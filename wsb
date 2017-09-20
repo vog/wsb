@@ -294,12 +294,16 @@ class RemotePgsql(
             ' --exclude-table-data {nodata_table.table}'.format(**locals())
             for nodata_table in self.nodata_tables
         )
+        if is_root:
+            su_begin, su_end = "su - postgres -c '", "'"
+        else:
+            su_begin, su_end = '', ''
         return (
             '    (\n'
             '        cd {filename}\n'
             '        {ssh_prefix}"\n'
             '            set -eu\n'
-            '            pg_dump{exclude_table_data} {self.dbname} > /tmp/pgsql_{self.dbname}_$UUID.sql"\n'
+            '            {su_begin}pg_dump{exclude_table_data} {self.dbname}{su_end} > /tmp/pgsql_{self.dbname}_$UUID.sql"\n'
             '        {rsync_prefix}"/tmp/pgsql_{self.dbname}_$UUID.sql" dump.sql\n'
             '        {ssh_prefix}"\n'
             '            set -eu\n'
