@@ -275,7 +275,7 @@ class RemotePgsql(
             'path',
             'dbname',
             'dump_file_exists',
-            'nodata_tables', # TODO pg_dump --exclude-table-data
+            'nodata_tables',
         ])):
 
     dir_spec = DirSpec(
