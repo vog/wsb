@@ -260,7 +260,7 @@ class RemoteMysql(
             '            set -eu\n'
             '            (\n'
             '                mysqldump --no-data {self.dbname}\n'
-            '                mysqldump --no-create-info --skip-extended-insert --complete-insert{ignore_tables} {self.dbname}\n'
+            '                mysqldump --no-create-info{ignore_tables} {self.dbname}\n'
             '            ) | egrep -v ^--.Dump.completed.on > /tmp/mysql_{self.dbname}_$UUID.sql"\n'
             '        {rsync_prefix}"/tmp/mysql_{self.dbname}_$UUID.sql" dump.sql\n'
             '        {ssh_prefix}"\n'
