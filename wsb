@@ -1,8 +1,6 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 '''wsb - Website Backup'''
-
-from __future__ import unicode_literals
 
 __copyright__ = '''\
 Copyright (C) Volker Diels-Grabsch <v@njh.eu>
@@ -382,7 +380,7 @@ class Backup(
             '#!/bin/sh\n'
             'set -eu\n'
             'START_DATETIME=$(date --utc "+%Y-%m-%d %H:%M:%SZ")\n'
-            'UUID=$(python -c "import uuid; print(uuid.uuid4())")\n'
+            'UUID=$(python3 -c "import uuid; print(uuid.uuid4())")\n'
             'cd -- "{self.path}"\n'
             .format(**locals())
         )
